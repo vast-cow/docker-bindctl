@@ -1,0 +1,230 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import os
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+STATE_DIR = Path(os.environ.get("DOCKER_BINDCTL_STATE_DIR", "/var/lib/docker-bindctl"))
+STATE_FILE = STATE_DIR / "state.json"
+HELPER = os.environ.get("DOCKER_BINDCTL_HELPER", "/usr/local/libexec/docker-bindctl-helper")
+
+
+def die(msg, code=1):
+    print(f"docker-bindctl: {msg}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+def run(cmd, *, capture=False):
+    try:
+        return subprocess.run(cmd, check=True, text=True,
+                              stdout=subprocess.PIPE if capture else None,
+                              stderr=subprocess.PIPE if capture else None)
+    except FileNotFoundError:
+        die(f"command not found: {cmd[0]}")
+    except subprocess.CalledProcessError as e:
+        detail = (e.stderr or "").strip() if capture else ""
+        die(detail or f"command failed: {' '.join(cmd)}")
+
+
+def docker_inspect(container):
+    p = run(["docker", "inspect", "--type", "container", "-f", "{{.Id}}\t{{.Name}}\t{{.State.Pid}}\t{{.State.Running}}", container], capture=True)
+    parts = p.stdout.strip().split("\t")
+    if len(parts) != 4:
+        die("unexpected docker inspect output")
+    cid, name, pid_s, running = parts
+    return {"id": cid, "name": name.lstrip("/"), "pid": int(pid_s), "running": running == "true"}
+
+
+def load_state():
+    try:
+        data = json.loads(STATE_FILE.read_text())
+        if data.get("version") != 1 or not isinstance(data.get("mounts"), list):
+            die(f"unsupported/corrupt state file: {STATE_FILE}")
+        return data
+    except FileNotFoundError:
+        return {"version": 1, "mounts": []}
+    except json.JSONDecodeError:
+        die(f"corrupt state file: {STATE_FILE}")
+
+
+def save_state(data):
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix="state.", dir=STATE_DIR)
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, STATE_FILE)
+    finally:
+        try: os.unlink(tmp)
+        except FileNotFoundError: pass
+
+
+def mountinfo_targets(pid):
+    targets = set()
+    try:
+        text = Path(f"/proc/{pid}/mountinfo").read_text()
+    except OSError:
+        return targets
+    def unescape(s):
+        return (s.replace("\\040", " ").replace("\\011", "\t")
+                 .replace("\\012", "\n").replace("\\134", "\\"))
+    for line in text.splitlines():
+        fields = line.split()
+        if len(fields) >= 5:
+            targets.add(unescape(fields[4]))
+    return targets
+
+
+def active_status(entry):
+    try:
+        info = docker_inspect(entry["container_id"])
+    except SystemExit:
+        return "gone"
+    if not info["running"]:
+        return "stopped"
+    if info["pid"] != entry.get("pid"):
+        return "stale(restarted)"
+    return "active" if entry["target"] in mountinfo_targets(info["pid"]) else "stale"
+
+
+def cmd_add(args):
+    if os.geteuid() != 0:
+        die("add must run as root")
+    src = str(Path(args.source).resolve(strict=True))
+    if not args.target.startswith("/") or args.target == "/":
+        die("target must be an absolute container path other than /")
+    info = docker_inspect(args.container)
+    if not info["running"] or info["pid"] <= 0:
+        die("container is not running")
+
+    state = load_state()
+    conflict = next((m for m in state["mounts"] if m["container_id"] == info["id"] and m["target"] == args.target), None)
+    if conflict:
+        die(f"target already tracked for this container: {args.target} (remove it first)")
+
+    run([HELPER, "add", str(info["pid"]), src, args.target])
+    entry = {"container_id": info["id"], "container_name": info["name"], "pid": info["pid"], "source": src, "target": args.target}
+    state["mounts"].append(entry)
+    try:
+        save_state(state)
+    except Exception:
+        # Roll back mount if persisting the ledger failed.
+        subprocess.run([HELPER, "remove", str(info["pid"]), args.target])
+        raise
+    print(f"added  {info['name']}:{args.target} <- {src}")
+
+
+def find_entry(state, container, target):
+    # First resolve container if possible; otherwise allow exact remembered name/id-prefix.
+    cid = None
+    try:
+        cid = docker_inspect(container)["id"]
+    except SystemExit:
+        pass
+    matches = []
+    for m in state["mounts"]:
+        if m["target"] != target:
+            continue
+        if cid and m["container_id"] == cid:
+            matches.append(m)
+        elif not cid and (m["container_name"] == container or m["container_id"].startswith(container)):
+            matches.append(m)
+    if len(matches) != 1:
+        die("tracked mount not found" if not matches else "ambiguous tracked mount")
+    return matches[0]
+
+
+def cmd_remove(args):
+    if os.geteuid() != 0:
+        die("remove must run as root")
+    state = load_state()
+    entry = find_entry(state, args.container, args.target)
+
+    # Only unmount if the original container instance is still running with the same PID.
+    unmounted = False
+    try:
+        info = docker_inspect(entry["container_id"])
+        if info["running"] and info["pid"] == entry.get("pid"):
+            run([HELPER, "remove", str(info["pid"]), entry["target"]])
+            unmounted = True
+    except SystemExit:
+        pass
+
+    state["mounts"].remove(entry)
+    save_state(state)
+    verb = "removed" if unmounted else "forgot(stale)"
+    print(f"{verb}  {entry['container_name']}:{entry['target']} <- {entry['source']}")
+
+
+def cmd_list(args):
+    state = load_state()
+    rows = []
+    for m in state["mounts"]:
+        if args.container and not (m["container_name"] == args.container or m["container_id"].startswith(args.container)):
+            try:
+                if docker_inspect(args.container)["id"] != m["container_id"]:
+                    continue
+            except SystemExit:
+                continue
+        rows.append((active_status(m), m))
+    if args.json:
+        print(json.dumps([{**m, "status": s} for s, m in rows], ensure_ascii=False, indent=2))
+        return
+    if not rows:
+        return
+    print(f"{'STATUS':18} {'CONTAINER':24} {'TARGET':30} SOURCE")
+    for s, m in rows:
+        print(f"{s:18} {m['container_name'][:24]:24} {m['target'][:30]:30} {m['source']}")
+
+
+def cmd_prune(args):
+    if os.geteuid() != 0:
+        die("prune must run as root")
+    state = load_state()
+    keep = []
+    removed = 0
+    for m in state["mounts"]:
+        if active_status(m) == "active":
+            keep.append(m)
+        else:
+            removed += 1
+    state["mounts"] = keep
+    save_state(state)
+    print(f"pruned {removed} stale entr{'y' if removed == 1 else 'ies'}")
+
+
+def main():
+    p = argparse.ArgumentParser(prog="docker-bindctl", description="Add/remove bind mounts to running Docker containers (Linux mount namespace hack).")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    a = sub.add_parser("add", help="add and remember a bind mount")
+    a.add_argument("container")
+    a.add_argument("source", help="host path")
+    a.add_argument("target", help="absolute path inside container")
+    a.set_defaults(func=cmd_add)
+
+    r = sub.add_parser("remove", aliases=["rm"], help="remove and forget a tracked bind mount")
+    r.add_argument("container")
+    r.add_argument("target")
+    r.set_defaults(func=cmd_remove)
+
+    l = sub.add_parser("list", aliases=["ls"], help="list mounts remembered by this tool")
+    l.add_argument("container", nargs="?")
+    l.add_argument("--json", action="store_true")
+    l.set_defaults(func=cmd_list)
+
+    q = sub.add_parser("prune", help="forget entries that are no longer active")
+    q.set_defaults(func=cmd_prune)
+
+    args = p.parse_args()
+    args.func(args)
+
+if __name__ == "__main__":
+    main()
