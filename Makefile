@@ -20,4 +20,10 @@ uninstall:
 clean:
 	rm -f docker-bindctl-helper
 
-.PHONY: all install uninstall clean
+test:
+	$(CC) $(CFLAGS) -o /tmp/docker-bindctl-helper-test tests/helper-fallback.c
+	/tmp/docker-bindctl-helper-test
+	$(CC) $(CFLAGS) -DTEST_OLD_HEADERS -o /tmp/docker-bindctl-helper-test-old tests/helper-fallback.c
+	/tmp/docker-bindctl-helper-test-old
+
+.PHONY: all install uninstall clean test

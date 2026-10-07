@@ -4,7 +4,7 @@ Add/remove bind mounts to an already-running Docker container on Linux, and keep
 
 ## Requirements
 
-- Linux kernel 5.2+ (`open_tree(2)` / `move_mount(2)`)
+- Linux kernel 3.8+ (mount namespace support in `setns(2)`)
 - Docker Engine on Linux
 - root / `CAP_SYS_ADMIN`
 - Python 3
@@ -58,6 +58,22 @@ sudo docker-bindctl remove demo /opt/live-config
 
 - Only regular files and directories are accepted as sources.
 - Directory binds are recursive (submounts are included).
+- On Linux 5.2+, the helper uses `open_tree(2)` / `move_mount(2)`.
+  If either syscall returns `ENOSYS`, it falls back to traditional
+  `mount(2)` with `MS_BIND` (and `MS_REC` for directories), supporting Linux
+  3.8–5.1. Other errors, including permission errors, are reported without
+  falling back. Builds with older headers lacking these syscall numbers
+  use the legacy path directly.
+- The legacy path retains a host source parent-directory FD before entering
+  the container namespace and chroot, then mounts a relative source path.
+  It resolves source symlinks on the host, but the source basename can still
+  be replaced between lookup and mount. Avoid concurrent changes to the
+  source path while adding a mount.
 - The destination is created if missing. Existing destination data is hidden while mounted and becomes visible again after removal.
 - The helper uses `MNT_DETACH` for removal.
 - This is a mount-namespace operation outside Docker's supported lifecycle/configuration model; use it primarily for debugging, development, emergency operations, or tooling where ephemeral mounts are intentional.
+
+Kernel API references: [setns(2)](https://man7.org/linux/man-pages/man2/setns.2.html),
+[open_tree(2)](https://man7.org/linux/man-pages/man2/open_tree.2.html),
+[move_mount(2)](https://man7.org/linux/man-pages/man2/move_mount.2.html),
+and [mount(2)](https://man7.org/linux/man-pages/man2/mount.2.html).

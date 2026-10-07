@@ -1,7 +1,6 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
-#include <linux/mount.h>
 #include <sched.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -26,12 +25,24 @@
 #endif
 
 static int xopen_tree(int dfd, const char *path, unsigned flags) {
+#ifdef SYS_open_tree
     return (int)syscall(SYS_open_tree, dfd, path, flags);
+#else
+    (void)dfd; (void)path; (void)flags;
+    errno = ENOSYS;
+    return -1;
+#endif
 }
 static int xmove_mount(int from_dfd, const char *from_path,
                        int to_dfd, const char *to_path, unsigned flags) {
+#ifdef SYS_move_mount
     return (int)syscall(SYS_move_mount, from_dfd, from_path,
                         to_dfd, to_path, flags);
+#else
+    (void)from_dfd; (void)from_path; (void)to_dfd; (void)to_path; (void)flags;
+    errno = ENOSYS;
+    return -1;
+#endif
 }
 
 static void die(const char *what) {
@@ -132,14 +143,44 @@ static void do_add(pid_t pid, const char *src, const char *dst) {
     unsigned flags = OPEN_TREE_CLONE | OPEN_TREE_CLOEXEC;
     if (S_ISDIR(st.st_mode)) flags |= AT_RECURSIVE;
     int treefd = xopen_tree(AT_FDCWD, src, flags);
-    if (treefd < 0) die("open_tree source (requires Linux 5.2+ and CAP_SYS_ADMIN)");
+    if (treefd < 0 && errno != ENOSYS) die("open_tree source");
+
+    /* Keep access to the host source even after setns/chroot. Prepare this
+       before entering the container in case move_mount also returns ENOSYS.
+       Canonicalize here so relative paths and symlinks resolve on the host. */
+    char *source = realpath(src, NULL);
+    if (!source) die("realpath source");
+    char *slash = strrchr(source, '/');
+    const char *name = slash[1] ? slash + 1 : ".";
+    char *relative = malloc(strlen(name) + 3);
+    if (!relative) die("malloc source path");
+    sprintf(relative, "./%s", name);
+    if (slash == source) source[1] = '\0'; else *slash = '\0';
+    int sourcefd = open(source, O_PATH | O_DIRECTORY | O_CLOEXEC);
+    if (sourcefd < 0) die("open source parent");
+    free(source);
 
     enter_container_mountns(pid);
     ensure_target(dst, st.st_mode);
 
-    if (xmove_mount(treefd, "", AT_FDCWD, dst, MOVE_MOUNT_F_EMPTY_PATH) < 0)
-        die("move_mount target");
-    close(treefd);
+    if (treefd >= 0) {
+        if (xmove_mount(treefd, "", AT_FDCWD, dst, MOVE_MOUNT_F_EMPTY_PATH) == 0) {
+            close(treefd);
+            close(sourcefd);
+            free(relative);
+            return;
+        }
+        if (errno != ENOSYS) die("move_mount target");
+        close(treefd);
+    }
+
+    if (fchdir(sourcefd) < 0) die("fchdir source parent");
+    unsigned long bind_flags = MS_BIND;
+    if (S_ISDIR(st.st_mode)) bind_flags |= MS_REC;
+    if (mount(relative, dst, NULL, bind_flags, NULL) < 0) die("bind mount target");
+    if (chdir("/") < 0) die("chdir /");
+    close(sourcefd);
+    free(relative);
 }
 
 static void do_remove(pid_t pid, const char *dst) {
@@ -171,4 +212,5 @@ int main(int argc, char **argv) {
         return 0;
     }
     usage(argv[0]);
+    return 2;
 }
