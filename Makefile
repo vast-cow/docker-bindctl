@@ -20,7 +20,8 @@ uninstall:
 clean:
 	rm -f docker-bindctl-helper
 
-test:
+test: docker-bindctl-helper
+	python3 -B -m unittest discover -s tests -p 'test_*.py'
 	$(CC) $(CFLAGS) -o /tmp/docker-bindctl-helper-test tests/helper-fallback.c
 	/tmp/docker-bindctl-helper-test
 	$(CC) $(CFLAGS) -DTEST_OLD_HEADERS -o /tmp/docker-bindctl-helper-test-old tests/helper-fallback.c

@@ -4,10 +4,13 @@ import json
 import os
 import subprocess
 import sys
+import stat
 import tempfile
 from pathlib import Path
 
-STATE_DIR = Path(os.environ.get("DOCKER_BINDCTL_STATE_DIR", "/var/lib/docker-bindctl"))
+ROOTLESS = False
+DOCKER_COMMAND = ["docker"]
+STATE_DIR = Path("/var/lib/docker-bindctl")
 STATE_FILE = STATE_DIR / "state.json"
 HELPER = os.environ.get("DOCKER_BINDCTL_HELPER", "/usr/local/libexec/docker-bindctl-helper")
 
@@ -21,7 +24,9 @@ def run(cmd, *, capture=False):
     try:
         return subprocess.run(cmd, check=True, text=True,
                               stdout=subprocess.PIPE if capture else None,
-                              stderr=subprocess.PIPE if capture else None)
+                              stderr=subprocess.PIPE if capture else None,
+                              env={k: v for k, v in os.environ.items() if k != "DOCKER_CONTEXT"}
+                              if cmd[:1] == ["docker"] and "--host" in cmd else None)
     except FileNotFoundError:
         die(f"command not found: {cmd[0]}")
     except subprocess.CalledProcessError as e:
@@ -29,8 +34,53 @@ def run(cmd, *, capture=False):
         die(detail or f"command failed: {' '.join(cmd)}")
 
 
+def state_directory(rootless):
+    override = os.environ.get("DOCKER_BINDCTL_STATE_DIR")
+    if override:
+        return Path(override)
+    if rootless:
+        base = os.environ.get("XDG_STATE_HOME")
+        if base and not Path(base).is_absolute():
+            die("XDG_STATE_HOME must be absolute")
+        return (Path(base) if base else Path.home() / ".local/state") / "docker-bindctl"
+    return Path("/var/lib/docker-bindctl")
+
+
+def configure_daemon():
+    global ROOTLESS, DOCKER_COMMAND, STATE_DIR, STATE_FILE
+    context = os.environ.get("DOCKER_CONTEXT")
+    endpoint = os.environ.get("DOCKER_HOST") if not context else None
+    if not endpoint:
+        if not context:
+            context = run(["docker", "context", "show"], capture=True).stdout.strip()
+        data = json.loads(run(["docker", "context", "inspect", context], capture=True).stdout)
+        endpoint = data[0]["Endpoints"]["docker"]["Host"]
+    # Docker PIDs must refer to this host. SSH/TCP endpoints cannot establish
+    # that; reject even localhost TCP rather than interpreting a remote PID.
+    if not endpoint.startswith("unix:///"):
+        die("only local Unix-socket Docker endpoints are supported; remote daemons are unsupported")
+    DOCKER_COMMAND = ["docker", "--host", endpoint]
+    options = json.loads(run(DOCKER_COMMAND + ["info", "--format", "{{json .SecurityOptions}}"], capture=True).stdout)
+    ROOTLESS = "name=rootless" in (options or [])
+    STATE_DIR = state_directory(ROOTLESS)
+    STATE_FILE = STATE_DIR / "state.json"
+
+
+def require_mutation_privilege():
+    if not ROOTLESS and os.geteuid() != 0:
+        die("rootful Docker mutations must run as root")
+
+
+def helper_command(operation, pid, *paths):
+    return [HELPER] + (["--rootless"] if ROOTLESS else []) + [operation, str(pid), *paths]
+
+
+def valid_target(target):
+    return target.startswith("/") and bool(target.strip("/")) and not {".", ".."}.intersection(target.split("/"))
+
+
 def docker_inspect(container):
-    p = run(["docker", "inspect", "--type", "container", "-f", "{{.Id}}\t{{.Name}}\t{{.State.Pid}}\t{{.State.Running}}", container], capture=True)
+    p = run(DOCKER_COMMAND + ["inspect", "--type", "container", "-f", "{{.Id}}\t{{.Name}}\t{{.State.Pid}}\t{{.State.Running}}", container], capture=True)
     parts = p.stdout.strip().split("\t")
     if len(parts) != 4:
         die("unexpected docker inspect output")
@@ -51,7 +101,11 @@ def load_state():
 
 
 def save_state(data):
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    STATE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    directory = STATE_DIR.lstat()
+    if not stat.S_ISDIR(directory.st_mode) or directory.st_uid != os.geteuid():
+        raise PermissionError(f"state directory must be a directory owned by the current user: {STATE_DIR}")
+    STATE_DIR.chmod(0o700)
     fd, tmp = tempfile.mkstemp(prefix="state.", dir=STATE_DIR)
     try:
         with os.fdopen(fd, "w") as f:
@@ -66,11 +120,13 @@ def save_state(data):
         except FileNotFoundError: pass
 
 
-def mountinfo_targets(pid):
+def mountinfo_targets(pid, *, strict=False):
     targets = set()
     try:
         text = Path(f"/proc/{pid}/mountinfo").read_text()
     except OSError:
+        if strict:
+            raise
         return targets
     def unescape(s):
         return (s.replace("\\040", " ").replace("\\011", "\t")
@@ -95,10 +151,9 @@ def active_status(entry):
 
 
 def cmd_add(args):
-    if os.geteuid() != 0:
-        die("add must run as root")
+    require_mutation_privilege()
     src = str(Path(args.source).resolve(strict=True))
-    if not args.target.startswith("/") or args.target == "/":
+    if not valid_target(args.target):
         die("target must be an absolute container path other than /")
     info = docker_inspect(args.container)
     if not info["running"] or info["pid"] <= 0:
@@ -109,14 +164,14 @@ def cmd_add(args):
     if conflict:
         die(f"target already tracked for this container: {args.target} (remove it first)")
 
-    run([HELPER, "add", str(info["pid"]), src, args.target])
+    run(helper_command("add", info["pid"], src, args.target))
     entry = {"container_id": info["id"], "container_name": info["name"], "pid": info["pid"], "source": src, "target": args.target}
     state["mounts"].append(entry)
     try:
         save_state(state)
     except Exception:
         # Roll back mount if persisting the ledger failed.
-        subprocess.run([HELPER, "remove", str(info["pid"]), args.target])
+        subprocess.run(helper_command("remove", info["pid"], args.target))
         raise
     print(f"added  {info['name']}:{args.target} <- {src}")
 
@@ -142,8 +197,7 @@ def find_entry(state, container, target):
 
 
 def cmd_remove(args):
-    if os.geteuid() != 0:
-        die("remove must run as root")
+    require_mutation_privilege()
     state = load_state()
     entry = find_entry(state, args.container, args.target)
 
@@ -151,11 +205,12 @@ def cmd_remove(args):
     unmounted = False
     try:
         info = docker_inspect(entry["container_id"])
-        if info["running"] and info["pid"] == entry.get("pid"):
-            run([HELPER, "remove", str(info["pid"]), entry["target"]])
-            unmounted = True
     except SystemExit:
-        pass
+        info = None
+    if (info and info["running"] and info["pid"] == entry.get("pid")
+            and entry["target"] in mountinfo_targets(info["pid"], strict=True)):
+        run(helper_command("remove", info["pid"], entry["target"]))
+        unmounted = True
 
     state["mounts"].remove(entry)
     save_state(state)
@@ -185,8 +240,7 @@ def cmd_list(args):
 
 
 def cmd_prune(args):
-    if os.geteuid() != 0:
-        die("prune must run as root")
+    require_mutation_privilege()
     state = load_state()
     keep = []
     removed = 0
@@ -224,7 +278,11 @@ def main():
     q.set_defaults(func=cmd_prune)
 
     args = p.parse_args()
-    args.func(args)
+    try:
+        configure_daemon()
+        args.func(args)
+    except (OSError, ValueError, KeyError, IndexError) as e:
+        die(str(e))
 
 if __name__ == "__main__":
     main()
